@@ -1,0 +1,15 @@
+/* Kept deliberately bare — the app carries its own styling.
+   Anything added here risks fighting the component's CSS. */
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

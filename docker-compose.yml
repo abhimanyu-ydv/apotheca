@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: apotheca-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: apotheca
+      POSTGRES_PASSWORD: apotheca
+      POSTGRES_DB: apotheca
+      # Deterministic collation, so ORDER BY on drug names doesn't drift
+      # between a developer's machine and the hospital's server.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - apotheca-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apotheca -d apotheca"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./server
+    container_name: apotheca-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://apotheca:apotheca@db:5432/apotheca
+      PORT: "3000"
+      CORS_ORIGIN: http://localhost:5173
+      SESSION_TTL_HOURS: "12"
+    ports:
+      - "3000:3000"
+    # Migrations run on boot so a fresh clone is one command away from working.
+    command: sh -c "npm run migrate && npm start"
+
+volumes:
+  apotheca-data:

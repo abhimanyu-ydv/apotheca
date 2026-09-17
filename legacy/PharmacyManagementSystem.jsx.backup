@@ -1,0 +1,3734 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import {
+  Pill,
+  Search,
+  Plus,
+  Trash2,
+  LogOut,
+  LayoutGrid,
+  Boxes,
+  Receipt,
+  CalendarClock,
+  Users,
+  ShieldCheck,
+  KeyRound,
+  Printer,
+  X,
+  AlertTriangle,
+  CheckCircle2,
+  Package,
+  Download,
+  RotateCcw,
+  ChevronRight,
+  Loader2,
+} from "lucide-react";
+
+/* ============================================================
+   STORAGE LAYER  —  acts as the database
+   Keys:  rx:users   rx:session   rx:stock   rx:bills
+   ============================================================ */
+
+const K = {
+  users: "rx:users",
+  session: "rx:session",
+  stock: "rx:stock",
+  bills: "rx:bills",
+  patients: "rx:patients",
+  prescriptions: "rx:prescriptions",
+};
+
+async function dbGet(key, fallback) {
+  try {
+    const r = await window.storage.get(key);
+    if (!r || r.value === undefined || r.value === null) return fallback;
+    return typeof r.value === "string" ? JSON.parse(r.value) : r.value;
+  } catch (e) {
+    return fallback;
+  }
+}
+async function dbSet(key, value) {
+  try {
+    await window.storage.set(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+async function dbDel(key) {
+  try {
+    await window.storage.delete(key);
+  } catch (e) {
+    /* key may not exist */
+  }
+}
+
+/* ---------- password hashing (SHA-256 + per-user salt) ---------- */
+function randSalt() {
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return Array.from(a)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+async function hash(text, salt) {
+  const buf = new TextEncoder().encode(`${salt}::${text}`);
+  const d = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(d))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/* ---------- patient & prescription ID generation ---------- */
+function genPatientId(patients) {
+  let id;
+  do {
+    const num = Math.floor(Math.random() * 99999)
+      .toString()
+      .padStart(5, "0");
+    id = `PAT-${num}`;
+  } while (patients.some((p) => p.id === id));
+  return id;
+}
+
+function genPrescriptionId(prescriptions) {
+  let id;
+  do {
+    const num = Math.floor(Math.random() * 99999)
+      .toString()
+      .padStart(5, "0");
+    id = `RX-${new Date().getFullYear()}-${num}`;
+  } while (prescriptions.some((p) => p.id === id));
+  return id;
+}
+
+/* ============================================================
+   DRUG MASTER CATALOG  —  powers the type-ahead suggestions
+   ============================================================ */
+
+const CATALOG = [
+  {
+    g: "Paracetamol",
+    brands: ["Dolo", "Crocin", "Calpol"],
+    cls: "Analgesic / Antipyretic",
+    sch: "OTC",
+    forms: [
+      { form: "Tablet", strengths: ["500 mg", "650 mg"] },
+      { form: "Syrup", strengths: ["125 mg/5 ml", "250 mg/5 ml"] },
+      { form: "Injection", strengths: ["150 mg/ml", "1000 mg/100 ml"] },
+    ],
+  },
+  {
+    g: "Amoxicillin + Clavulanic Acid",
+    brands: ["Augmentin", "Clavam", "Moxikind-CV"],
+    cls: "Antibiotic (Penicillin)",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["625 mg", "1000 mg"] },
+      { form: "Syrup", strengths: ["228.5 mg/5 ml", "457 mg/5 ml"] },
+      { form: "Injection", strengths: ["1.2 g"] },
+    ],
+  },
+  {
+    g: "Azithromycin",
+    brands: ["Azithral", "Zithromax", "Azee"],
+    cls: "Antibiotic (Macrolide)",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["250 mg", "500 mg"] },
+      { form: "Syrup", strengths: ["100 mg/5 ml", "200 mg/5 ml"] },
+    ],
+  },
+  {
+    g: "Pantoprazole",
+    brands: ["Pan", "Pantocid", "Pantop"],
+    cls: "Proton Pump Inhibitor",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["20 mg", "40 mg"] },
+      { form: "Injection", strengths: ["40 mg"] },
+    ],
+  },
+  {
+    g: "Cetirizine",
+    brands: ["Cetzine", "Alerid", "Okacet"],
+    cls: "Antihistamine",
+    sch: "OTC",
+    forms: [
+      { form: "Tablet", strengths: ["5 mg", "10 mg"] },
+      { form: "Syrup", strengths: ["5 mg/5 ml"] },
+    ],
+  },
+  {
+    g: "Metformin",
+    brands: ["Glycomet", "Glucophage", "Obimet"],
+    cls: "Antidiabetic (Biguanide)",
+    sch: "H",
+    forms: [{ form: "Tablet", strengths: ["500 mg", "850 mg", "1000 mg"] }],
+  },
+  {
+    g: "Amlodipine",
+    brands: ["Amlong", "Stamlo", "Amlopres"],
+    cls: "Antihypertensive (CCB)",
+    sch: "H",
+    forms: [{ form: "Tablet", strengths: ["2.5 mg", "5 mg", "10 mg"] }],
+  },
+  {
+    g: "Atorvastatin",
+    brands: ["Atorva", "Lipitor", "Storvas"],
+    cls: "Lipid-lowering (Statin)",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["10 mg", "20 mg", "40 mg", "80 mg"] },
+    ],
+  },
+  {
+    g: "Ibuprofen",
+    brands: ["Brufen", "Combiflam", "Ibugesic"],
+    cls: "NSAID",
+    sch: "OTC",
+    forms: [
+      { form: "Tablet", strengths: ["200 mg", "400 mg", "600 mg"] },
+      { form: "Syrup", strengths: ["100 mg/5 ml"] },
+      { form: "Tube (Gel)", strengths: ["5% w/w"] },
+    ],
+  },
+  {
+    g: "Diclofenac",
+    brands: ["Voveran", "Dynapar", "Volini"],
+    cls: "NSAID",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["50 mg", "75 mg SR", "100 mg SR"] },
+      { form: "Tube (Gel)", strengths: ["1% w/w", "1.16% w/w"] },
+      { form: "Injection", strengths: ["75 mg/3 ml"] },
+    ],
+  },
+  {
+    g: "Omeprazole",
+    brands: ["Omez", "Ocid", "Prilosec"],
+    cls: "Proton Pump Inhibitor",
+    sch: "H",
+    forms: [{ form: "Capsule", strengths: ["20 mg", "40 mg"] }],
+  },
+  {
+    g: "Montelukast + Levocetirizine",
+    brands: ["Montek LC", "Montair LC"],
+    cls: "Anti-asthmatic / Antihistamine",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["10 mg + 5 mg"] },
+      { form: "Syrup", strengths: ["4 mg + 2.5 mg/5 ml"] },
+    ],
+  },
+  {
+    g: "Salbutamol",
+    brands: ["Asthalin", "Ventorlin"],
+    cls: "Bronchodilator",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["2 mg", "4 mg"] },
+      { form: "Inhaler", strengths: ["100 mcg/dose"] },
+      { form: "Respule", strengths: ["2.5 mg/2.5 ml"] },
+    ],
+  },
+  {
+    g: "Metronidazole",
+    brands: ["Flagyl", "Metrogyl"],
+    cls: "Antibiotic / Antiprotozoal",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["200 mg", "400 mg"] },
+      { form: "Syrup", strengths: ["200 mg/5 ml"] },
+      { form: "Tube (Gel)", strengths: ["1% w/w"] },
+    ],
+  },
+  {
+    g: "Ondansetron",
+    brands: ["Emeset", "Vomikind", "Zofer"],
+    cls: "Antiemetic",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["4 mg", "8 mg"] },
+      { form: "Syrup", strengths: ["2 mg/5 ml"] },
+      { form: "Injection", strengths: ["2 mg/ml"] },
+    ],
+  },
+  {
+    g: "Levothyroxine",
+    brands: ["Thyronorm", "Eltroxin"],
+    cls: "Thyroid hormone",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["25 mcg", "50 mcg", "75 mcg", "100 mcg"] },
+    ],
+  },
+  {
+    g: "Losartan",
+    brands: ["Losar", "Repace"],
+    cls: "Antihypertensive (ARB)",
+    sch: "H",
+    forms: [{ form: "Tablet", strengths: ["25 mg", "50 mg"] }],
+  },
+  {
+    g: "Ciprofloxacin",
+    brands: ["Ciplox", "Cifran"],
+    cls: "Antibiotic (Fluoroquinolone)",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["250 mg", "500 mg"] },
+      { form: "Eye/Ear Drops", strengths: ["0.3% w/v"] },
+    ],
+  },
+  {
+    g: "Ranitidine",
+    brands: ["Zinetac", "Aciloc"],
+    cls: "H2 blocker",
+    sch: "H",
+    forms: [{ form: "Tablet", strengths: ["150 mg", "300 mg"] }],
+  },
+  {
+    g: "Vitamin D3 (Cholecalciferol)",
+    brands: ["Uprise-D3", "Calcirol"],
+    cls: "Supplement",
+    sch: "OTC",
+    forms: [
+      { form: "Sachet", strengths: ["60000 IU"] },
+      { form: "Tablet", strengths: ["1000 IU", "2000 IU"] },
+    ],
+  },
+  {
+    g: "Calcium + Vitamin D3",
+    brands: ["Shelcal", "Calcimax"],
+    cls: "Supplement",
+    sch: "OTC",
+    forms: [{ form: "Tablet", strengths: ["500 mg + 250 IU"] }],
+  },
+  {
+    g: "Insulin Human",
+    brands: ["Huminsulin", "Actrapid"],
+    cls: "Antidiabetic (Insulin)",
+    sch: "H",
+    forms: [{ form: "Injection", strengths: ["40 IU/ml", "100 IU/ml"] }],
+  },
+  {
+    g: "Prednisolone",
+    brands: ["Wysolone", "Omnacortil"],
+    cls: "Corticosteroid",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["5 mg", "10 mg", "20 mg"] },
+      { form: "Syrup", strengths: ["5 mg/5 ml"] },
+    ],
+  },
+  {
+    g: "Betamethasone",
+    brands: ["Betnovate", "Betnesol"],
+    cls: "Topical corticosteroid",
+    sch: "H",
+    forms: [
+      { form: "Tube (Cream)", strengths: ["0.1% w/w"] },
+      { form: "Tablet", strengths: ["0.5 mg"] },
+    ],
+  },
+  {
+    g: "Silver Sulfadiazine",
+    brands: ["Silverex", "Burnheal"],
+    cls: "Topical antibacterial (burns)",
+    sch: "H",
+    forms: [{ form: "Tube (Cream)", strengths: ["1% w/w"] }],
+  },
+  {
+    g: "Povidone Iodine",
+    brands: ["Betadine", "Cipladine"],
+    cls: "Antiseptic",
+    sch: "OTC",
+    forms: [
+      { form: "Tube (Ointment)", strengths: ["5% w/w", "10% w/w"] },
+      { form: "Solution", strengths: ["5% w/v"] },
+    ],
+  },
+  {
+    g: "ORS + Zinc",
+    brands: ["Electral", "Walyte"],
+    cls: "Rehydration",
+    sch: "OTC",
+    forms: [
+      { form: "Sachet", strengths: ["21.8 g"] },
+      { form: "Syrup", strengths: ["20 mg/5 ml"] },
+    ],
+  },
+  {
+    g: "Domperidone",
+    brands: ["Domstal", "Vomistop"],
+    cls: "Prokinetic / Antiemetic",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["10 mg"] },
+      { form: "Syrup", strengths: ["1 mg/ml"] },
+    ],
+  },
+  {
+    g: "Tramadol",
+    brands: ["Ultracet", "Tramazac"],
+    cls: "Opioid analgesic",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["50 mg", "100 mg"] },
+      { form: "Injection", strengths: ["50 mg/ml"] },
+    ],
+  },
+  {
+    g: "Clopidogrel",
+    brands: ["Clopilet", "Deplatt"],
+    cls: "Antiplatelet",
+    sch: "H",
+    forms: [{ form: "Tablet", strengths: ["75 mg", "150 mg"] }],
+  },
+  {
+    g: "Furosemide",
+    brands: ["Lasix", "Frusenex"],
+    cls: "Loop diuretic",
+    sch: "H",
+    forms: [
+      { form: "Tablet", strengths: ["40 mg"] },
+      { form: "Injection", strengths: ["10 mg/ml"] },
+    ],
+  },
+  {
+    g: "Iron + Folic Acid",
+    brands: ["Autrin", "Fefol"],
+    cls: "Haematinic",
+    sch: "OTC",
+    forms: [
+      { form: "Tablet", strengths: ["100 mg + 1.5 mg"] },
+      { form: "Syrup", strengths: ["50 mg/15 ml"] },
+    ],
+  },
+  {
+    g: "Normal Saline (Sodium Chloride)",
+    brands: ["NS IV"],
+    cls: "IV fluid",
+    sch: "H",
+    forms: [
+      {
+        form: "IV Fluid",
+        strengths: ["0.9% w/v — 500 ml", "0.9% w/v — 1000 ml"],
+      },
+    ],
+  },
+  {
+    g: "Dextrose",
+    brands: ["DNS", "D5"],
+    cls: "IV fluid",
+    sch: "H",
+    forms: [
+      { form: "IV Fluid", strengths: ["5% w/v — 500 ml", "25% w/v — 100 ml"] },
+    ],
+  },
+];
+
+const FORMS = [
+  "Tablet",
+  "Capsule",
+  "Syrup",
+  "Injection",
+  "Tube (Cream)",
+  "Tube (Gel)",
+  "Tube (Ointment)",
+  "Eye/Ear Drops",
+  "Inhaler",
+  "Respule",
+  "Sachet",
+  "Solution",
+  "IV Fluid",
+];
+
+const PACK_UNIT = (form) => {
+  if (/Tablet|Capsule/.test(form)) return "tablets";
+  if (/Syrup|Solution|Drops/.test(form)) return "bottles";
+  if (/Tube/.test(form)) return "tubes";
+  if (/Injection/.test(form)) return "vials";
+  if (/IV Fluid/.test(form)) return "bottles";
+  if (/Sachet/.test(form)) return "sachets";
+  if (/Inhaler|Respule/.test(form)) return "units";
+  return "units";
+};
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+const uid = () =>
+  Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+const today = () => new Date(new Date().toDateString());
+const daysLeft = (d) => Math.round((new Date(d) - today()) / 86400000);
+const money = (n) => "₹" + Number(n || 0).toFixed(2);
+const fmtDate = (d) =>
+  d
+    ? new Date(d).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      })
+    : "—";
+
+function expiryState(dateStr) {
+  const d = daysLeft(dateStr);
+  if (d < 0) return { key: "expired", label: "Expired", days: d };
+  if (d <= 30) return { key: "critical", label: `${d} d left`, days: d };
+  if (d <= 90) return { key: "warning", label: `${d} d left`, days: d };
+  return { key: "ok", label: `${d} d left`, days: d };
+}
+
+/* seed inventory so the hospital demo is not an empty shell */
+function seedStock() {
+  const dt = (n) =>
+    new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+  const base = [
+    [
+      "Paracetamol",
+      "Dolo",
+      "Tablet",
+      "650 mg",
+      420,
+      "DL2419",
+      dt(400),
+      2.1,
+      1.62,
+      12,
+      "Micro Labs",
+      "A-01",
+      100,
+    ],
+    [
+      "Paracetamol",
+      "Calpol",
+      "Syrup",
+      "125 mg/5 ml",
+      36,
+      "CP1180",
+      dt(150),
+      48.0,
+      36.0,
+      12,
+      "GSK",
+      "A-02",
+      12,
+    ],
+    [
+      "Amoxicillin + Clavulanic Acid",
+      "Augmentin",
+      "Tablet",
+      "625 mg",
+      180,
+      "AG7741",
+      dt(240),
+      21.5,
+      16.8,
+      12,
+      "GSK",
+      "B-03",
+      60,
+    ],
+    [
+      "Pantoprazole",
+      "Pan",
+      "Tablet",
+      "40 mg",
+      260,
+      "PN9032",
+      dt(310),
+      8.4,
+      5.9,
+      12,
+      "Alkem",
+      "B-01",
+      80,
+    ],
+    [
+      "Cetirizine",
+      "Cetzine",
+      "Tablet",
+      "10 mg",
+      96,
+      "CZ2201",
+      dt(22),
+      1.9,
+      1.2,
+      12,
+      "Dr. Reddy's",
+      "C-04",
+      100,
+    ],
+    [
+      "Metformin",
+      "Glycomet",
+      "Tablet",
+      "500 mg",
+      340,
+      "GM5510",
+      dt(500),
+      3.2,
+      2.1,
+      12,
+      "USV",
+      "C-01",
+      120,
+    ],
+    [
+      "Amlodipine",
+      "Amlong",
+      "Tablet",
+      "5 mg",
+      210,
+      "AM3390",
+      dt(75),
+      3.8,
+      2.4,
+      12,
+      "Micro Labs",
+      "C-02",
+      100,
+    ],
+    [
+      "Ondansetron",
+      "Emeset",
+      "Injection",
+      "2 mg/ml",
+      24,
+      "EM4412",
+      dt(-12),
+      16.0,
+      11.0,
+      12,
+      "Cipla",
+      "D-01",
+      20,
+    ],
+    [
+      "Silver Sulfadiazine",
+      "Silverex",
+      "Tube (Cream)",
+      "1% w/w",
+      14,
+      "SX8820",
+      dt(60),
+      132.0,
+      96.0,
+      12,
+      "Ranbaxy",
+      "E-02",
+      10,
+    ],
+    [
+      "Diclofenac",
+      "Volini",
+      "Tube (Gel)",
+      "1.16% w/w",
+      22,
+      "VL1102",
+      dt(210),
+      155.0,
+      118.0,
+      12,
+      "Sun Pharma",
+      "E-01",
+      10,
+    ],
+    [
+      "Normal Saline (Sodium Chloride)",
+      "NS IV",
+      "IV Fluid",
+      "0.9% w/v — 500 ml",
+      48,
+      "NS0091",
+      dt(330),
+      42.0,
+      30.0,
+      12,
+      "Fresenius",
+      "F-01",
+      24,
+    ],
+    [
+      "Azithromycin",
+      "Azithral",
+      "Tablet",
+      "500 mg",
+      45,
+      "AZ6621",
+      dt(-40),
+      32.0,
+      24.0,
+      12,
+      "Alembic",
+      "B-02",
+      60,
+    ],
+    [
+      "ORS + Zinc",
+      "Electral",
+      "Sachet",
+      "21.8 g",
+      8,
+      "EL3311",
+      dt(120),
+      22.0,
+      16.0,
+      5,
+      "FDC",
+      "G-01",
+      30,
+    ],
+  ];
+  return base.map(
+    ([
+      name,
+      brand,
+      form,
+      strength,
+      qty,
+      batchNo,
+      expiry,
+      mrp,
+      cost,
+      gst,
+      mfr,
+      rack,
+      reorder,
+    ]) => {
+      const c = CATALOG.find((x) => x.g === name);
+      return {
+        id: uid(),
+        name,
+        brand,
+        form,
+        strength,
+        qty,
+        batchNo,
+        expiry,
+        mrp,
+        cost,
+        gst,
+        mfr,
+        rack,
+        reorder,
+        cls: c ? c.cls : "",
+        sch: c ? c.sch : "OTC",
+        addedAt: new Date().toISOString(),
+        addedBy: "System seed",
+      };
+    },
+  );
+}
+
+/* ============================================================
+   STYLES
+   ============================================================ */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+.rx * { box-sizing: border-box; }
+.rx {
+  --ink:#0F2233; --ink2:#1D3B54; --paper:#EBF1F4; --surface:#FFFFFF;
+  --line:#D2DEE5; --line2:#E7EEF2; --muted:#5F7688;
+  --teal:#0E7A6B; --teal-d:#0A5C51; --teal-l:#E3F2EF;
+  --amber:#B26A05; --amber-l:#FDF0DC;
+  --red:#A8221B; --red-l:#FBE6E4;
+  font-family:'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  color:var(--ink); background:var(--paper);
+  min-height:100vh; font-size:14px; line-height:1.45;
+}
+.rx h1,.rx h2,.rx h3,.rx .disp { font-family:'IBM Plex Sans Condensed','IBM Plex Sans',sans-serif; letter-spacing:-0.01em; }
+.rx .mono { font-family:'IBM Plex Mono', ui-monospace, monospace; font-variant-numeric:tabular-nums; }
+.rx button, .rx input, .rx select, .rx textarea { font:inherit; color:inherit; }
+.rx :focus-visible { outline:2px solid var(--teal); outline-offset:2px; }
+
+/* --- eyebrow / labels --- */
+.eyebrow { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--muted); }
+
+/* --- auth --- */
+.auth { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(0,1fr); min-height:100vh; }
+.auth-side { background:var(--ink); color:#DCE8EF; padding:44px 40px; display:flex; flex-direction:column;
+  justify-content:space-between; position:relative; overflow:hidden; }
+.auth-side::after { content:'℞'; position:absolute; right:-70px; bottom:-130px; font-size:440px; line-height:1;
+  font-family:'IBM Plex Sans Condensed',serif; color:rgba(255,255,255,.045); pointer-events:none; }
+.auth-form { background:var(--surface); padding:44px 40px; display:flex; flex-direction:column; justify-content:center; }
+.auth-inner { width:100%; max-width:380px; margin:0 auto; }
+@media (max-width:860px){ .auth{grid-template-columns:1fr;} .auth-side{padding:28px 22px; min-height:auto;}
+  .auth-side::after{font-size:230px; right:-40px; bottom:-80px;} .auth-form{padding:28px 22px;} }
+
+/* --- label strip (signature motif) --- */
+.strip { border:1px solid rgba(255,255,255,.18); border-left:4px solid var(--teal);
+  padding:12px 14px; background:rgba(255,255,255,.05); }
+.strip + .strip { border-top:none; }
+
+/* --- shell --- */
+.shell { display:grid; grid-template-columns:236px minmax(0,1fr); min-height:100vh; }
+.rail { background:var(--ink); color:#C9D9E3; padding:18px 12px; display:flex; flex-direction:column; gap:2px; }
+.rail-brand { padding:6px 10px 18px; display:flex; gap:10px; align-items:center; }
+.nav { display:flex; align-items:center; gap:10px; padding:9px 11px; border-radius:3px;
+  background:none; border:none; width:100%; text-align:left; cursor:pointer; color:#A9C0CE; font-size:13.5px; }
+.nav:hover { background:rgba(255,255,255,.06); color:#fff; }
+.nav.on { background:var(--teal); color:#fff; font-weight:600; }
+.nav .cnt { margin-left:auto; font-family:'IBM Plex Mono',monospace; font-size:11px;
+  background:rgba(255,255,255,.14); padding:1px 6px; border-radius:2px; }
+.nav.on .cnt { background:rgba(0,0,0,.22); }
+.main { padding:0 0 60px; min-width:0; }
+.topbar { background:var(--surface); border-bottom:1px solid var(--line);
+  padding:14px 26px; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+.pad { padding:22px 26px; }
+@media (max-width:820px){ .shell{grid-template-columns:1fr;} .rail{flex-direction:row; overflow-x:auto; padding:8px;}
+  .rail-brand{display:none;} .nav{width:auto; white-space:nowrap;} .pad{padding:16px;} .topbar{padding:12px 16px;} }
+
+/* --- cards --- */
+.card { background:var(--surface); border:1px solid var(--line); border-radius:3px; }
+.card-h { padding:12px 16px; border-bottom:1px solid var(--line2); display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.card-b { padding:16px; }
+.grid { display:grid; gap:14px; }
+.g4 { grid-template-columns:repeat(4,minmax(0,1fr)); }
+.g3 { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.g2 { grid-template-columns:repeat(2,minmax(0,1fr)); }
+@media (max-width:1000px){ .g4{grid-template-columns:repeat(2,minmax(0,1fr));} .g3{grid-template-columns:1fr;} }
+@media (max-width:620px){ .g4,.g2{grid-template-columns:1fr;} }
+
+/* --- stat --- */
+.stat { background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--teal);
+  border-radius:3px; padding:14px 16px; }
+.stat .n { font-family:'IBM Plex Sans Condensed',sans-serif; font-size:30px; font-weight:600; line-height:1.05;
+  font-variant-numeric:tabular-nums; }
+
+/* --- fields --- */
+.f { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.f label { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:.12em;
+  text-transform:uppercase; color:var(--muted); }
+.f input,.f select,.f textarea { border:1px solid var(--line); border-radius:2px; padding:9px 10px;
+  background:#FCFDFE; width:100%; }
+.f input:focus,.f select:focus { border-color:var(--teal); background:#fff; }
+.f .hint { font-size:11.5px; color:var(--muted); }
+
+/* --- buttons --- */
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:9px 15px;
+  border-radius:2px; border:1px solid var(--line); background:var(--surface); cursor:pointer; font-weight:500; }
+.btn:hover { border-color:var(--ink2); }
+.btn.p { background:var(--teal); border-color:var(--teal); color:#fff; }
+.btn.p:hover { background:var(--teal-d); border-color:var(--teal-d); }
+.btn.d { background:var(--red); border-color:var(--red); color:#fff; }
+.btn.g { background:none; border-color:transparent; color:var(--muted); }
+.btn.g:hover { color:var(--ink); background:var(--line2); }
+.btn:disabled { opacity:.45; cursor:not-allowed; }
+.btn.sm { padding:5px 10px; font-size:12.5px; }
+.btn.full { width:100%; }
+.link { background:none; border:none; color:var(--teal); cursor:pointer; padding:0; font-weight:500; }
+.link:hover { text-decoration:underline; }
+
+/* --- table --- */
+.tbl { width:100%; border-collapse:collapse; }
+.tbl th { text-align:left; font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:.12em;
+  text-transform:uppercase; color:var(--muted); font-weight:500; padding:9px 12px; border-bottom:1px solid var(--line); }
+.tbl td { padding:11px 12px; border-bottom:1px solid var(--line2); vertical-align:middle; }
+.tbl tr:last-child td { border-bottom:none; }
+.tbl tbody tr:hover { background:#F7FAFB; }
+.scroll { overflow-x:auto; }
+
+/* --- pills --- */
+.tag { display:inline-flex; align-items:center; gap:5px; font-family:'IBM Plex Mono',monospace;
+  font-size:10.5px; letter-spacing:.06em; padding:2px 7px; border-radius:2px; text-transform:uppercase; }
+.t-ok { background:var(--teal-l); color:var(--teal-d); }
+.t-warn { background:var(--amber-l); color:var(--amber); }
+.t-bad { background:var(--red-l); color:var(--red); }
+.t-mut { background:var(--line2); color:var(--muted); }
+
+/* --- shelf-life bar (signature) --- */
+.life { height:5px; background:var(--line2); border-radius:2px; overflow:hidden; min-width:64px; }
+.life i { display:block; height:100%; }
+.life.ok i { background:var(--teal); } .life.warning i { background:var(--amber); }
+.life.critical i { background:var(--red); } .life.expired i { background:var(--red); }
+
+/* --- suggestion dropdown --- */
+.sugg-wrap { position:relative; }
+.sugg { position:absolute; z-index:40; top:calc(100% + 4px); left:0; right:0; background:#fff;
+  border:1px solid var(--line); border-radius:2px; box-shadow:0 10px 28px rgba(15,34,51,.14);
+  max-height:330px; overflow-y:auto; }
+.sugg-i { padding:9px 12px; cursor:pointer; border-bottom:1px solid var(--line2); display:flex; gap:10px; align-items:center; }
+.sugg-i:last-child { border-bottom:none; }
+.sugg-i:hover, .sugg-i.hi { background:var(--teal-l); }
+.sugg-h { padding:6px 12px; background:#F5F9FA; border-bottom:1px solid var(--line2); }
+
+/* --- modal --- */
+.ov { position:fixed; inset:0; background:rgba(15,34,51,.55); display:flex; align-items:flex-start;
+  justify-content:center; padding:26px 16px; z-index:80; overflow-y:auto; }
+.modal { background:#fff; border-radius:3px; width:100%; max-width:520px; }
+
+/* --- receipt --- */
+.receipt { background:#fff; font-family:'IBM Plex Mono',monospace; font-size:12px; padding:22px; color:#000; }
+.receipt hr { border:none; border-top:1px dashed #999; margin:9px 0; }
+.receipt .row { display:flex; justify-content:space-between; gap:10px; }
+.perf { border-top:2px dashed var(--line); }
+
+.banner { display:flex; gap:10px; align-items:flex-start; padding:11px 14px; border-radius:2px; font-size:13px; }
+.b-bad { background:var(--red-l); color:var(--red); }
+.b-ok { background:var(--teal-l); color:var(--teal-d); }
+.b-warn { background:var(--amber-l); color:var(--amber); }
+
+.empty { text-align:center; padding:44px 20px; color:var(--muted); }
+
+@media print {
+  body * { visibility:hidden; }
+  .print-me, .print-me * { visibility:visible; }
+  .print-me { position:absolute; left:0; top:0; width:100%; }
+  .no-print { display:none !important; }
+}
+@media (prefers-reduced-motion:reduce){ .rx * { transition:none !important; animation:none !important; } }
+`;
+
+/* ============================================================
+   SMALL UI PIECES
+   ============================================================ */
+const Field = ({ label, hint, children }) => (
+  <div className="f">
+    <label>{label}</label>
+    {children}
+    {hint && <span className="hint">{hint}</span>}
+  </div>
+);
+
+const Input = (p) => <input {...p} />;
+
+function ExpiryTag({ date }) {
+  const s = expiryState(date);
+  const cls =
+    s.key === "expired" || s.key === "critical"
+      ? "t-bad"
+      : s.key === "warning"
+        ? "t-warn"
+        : "t-ok";
+  return <span className={`tag ${cls}`}>{s.label}</span>;
+}
+
+function LifeBar({ date, addedAt }) {
+  const s = expiryState(date);
+  const total = Math.max(
+    1,
+    Math.round((new Date(date) - new Date(addedAt || Date.now())) / 86400000),
+  );
+  const pct =
+    s.days <= 0 ? 100 : Math.max(4, Math.min(100, (s.days / total) * 100));
+  return (
+    <div className={`life ${s.key}`} title={`${s.days} days`}>
+      <i style={{ width: pct + "%" }} />
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, tone }) {
+  const c =
+    tone === "bad"
+      ? "var(--red)"
+      : tone === "warn"
+        ? "var(--amber)"
+        : "var(--teal)";
+  return (
+    <div className="stat" style={{ borderLeftColor: c }}>
+      <div className="eyebrow">{label}</div>
+      <div className="n" style={{ color: tone ? c : "var(--ink)" }}>
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   AUTH SCREEN WITH ROLE SELECTION
+   ============================================================ */
+function Auth({ users, onSignup, onLogin, onReset }) {
+  const [mode, setMode] = useState(users.length ? "login" : "signup");
+  const [err, setErr] = useState("");
+  const [ok, setOk] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [name, setName] = useState("");
+  const [pharmacy, setPharmacy] = useState("");
+  const [role, setRole] = useState("Pharmacist");
+  const [pw2, setPw2] = useState("");
+  const [q, setQ] = useState("Which city was your first posting in?");
+  const [a, setA] = useState("");
+
+  const [rStage, setRStage] = useState(1);
+  const [rUser, setRUser] = useState(null);
+  const [rAns, setRAns] = useState("");
+
+  const say = (e, o = "") => {
+    setErr(e);
+    setOk(o);
+  };
+
+  const submitSignup = async () => {
+    say("");
+    if (!name.trim() || !email.trim() || !pw)
+      return say("Fill in name, email and password.");
+    if (!/^\S+@\S+\.\S+$/.test(email))
+      return say("That email address doesn't look right.");
+    if (pw.length < 8) return say("Password needs at least 8 characters.");
+    if (pw !== pw2) return say("The two passwords don't match.");
+    if (!a.trim())
+      return say("Add a security answer so you can recover this account.");
+    if (users.some((u) => u.email.toLowerCase() === email.trim().toLowerCase()))
+      return say("An account already uses this email.");
+    setBusy(true);
+    await onSignup({
+      name: name.trim(),
+      email: email.trim(),
+      pharmacy: pharmacy.trim(),
+      role,
+      pw,
+      q,
+      a: a.trim(),
+    });
+    setBusy(false);
+  };
+
+  const submitLogin = async () => {
+    say("");
+    setBusy(true);
+    const r = await onLogin(email.trim(), pw);
+    setBusy(false);
+    if (r) say(r);
+  };
+
+  const findUser = () => {
+    const u = users.find(
+      (x) => x.email.toLowerCase() === email.trim().toLowerCase(),
+    );
+    if (!u) return say("No account found for that email.");
+    setRUser(u);
+    setRStage(2);
+    say("");
+  };
+  const doReset = async () => {
+    say("");
+    if (pw.length < 8) return say("New password needs at least 8 characters.");
+    if (pw !== pw2) return say("The two passwords don't match.");
+    setBusy(true);
+    const r = await onReset(rUser, rAns.trim(), pw);
+    setBusy(false);
+    if (r) return say(r);
+    setMode("login");
+    setRStage(1);
+    setPw("");
+    setPw2("");
+    say("", "Password updated. Sign in with the new one.");
+  };
+
+  const title =
+    mode === "signup"
+      ? users.length
+        ? "Create a staff account"
+        : "Set up the pharmacy"
+      : mode === "login"
+        ? "Sign in"
+        : "Reset your password";
+
+  return (
+    <div className="rx">
+      <style>{CSS}</style>
+      <div className="auth">
+        <div className="auth-side">
+          <div>
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+                marginBottom: 30,
+              }}
+            >
+              <div
+                style={{
+                  width: 34,
+                  height: 34,
+                  background: "var(--teal)",
+                  display: "grid",
+                  placeItems: "center",
+                  borderRadius: 2,
+                }}
+              >
+                <Pill size={18} color="#fff" />
+              </div>
+              <div>
+                <div
+                  className="disp"
+                  style={{ fontSize: 17, fontWeight: 600, color: "#fff" }}
+                >
+                  APOTHECA
+                </div>
+                <div className="eyebrow" style={{ color: "#7FA0B3" }}>
+                  Hospital pharmacy system
+                </div>
+              </div>
+            </div>
+            <h1
+              style={{
+                fontSize: 34,
+                lineHeight: 1.1,
+                margin: "0 0 12px",
+                color: "#fff",
+                maxWidth: 420,
+              }}
+            >
+              Multi-role pharmacy management with prescriptions & accuracy.
+            </h1>
+            <p style={{ color: "#9FBACA", maxWidth: 420, margin: 0 }}>
+              Admins manage staff and inventory. Pharmacists dispense medicines.
+              Doctors write prescriptions. Every patient gets a unique ID.
+              Batch-level expiry tracking.
+            </p>
+          </div>
+          <div style={{ position: "relative", zIndex: 2, maxWidth: 420 }}>
+            <div className="strip">
+              <div className="eyebrow" style={{ color: "#7FA0B3" }}>
+                Role-Based Access
+              </div>
+              <div style={{ color: "#DCE8EF" }}>
+                Admin, Pharmacist, and Doctor roles with specific permissions.
+              </div>
+            </div>
+            <div className="strip">
+              <div className="eyebrow" style={{ color: "#7FA0B3" }}>
+                Patient IDs
+              </div>
+              <div style={{ color: "#DCE8EF" }}>
+                Unique patient identifiers prevent mix-ups with duplicate names.
+              </div>
+            </div>
+            <div className="strip">
+              <div className="eyebrow" style={{ color: "#7FA0B3" }}>
+                E-Prescriptions
+              </div>
+              <div style={{ color: "#DCE8EF" }}>
+                Doctors write prescriptions that auto-route to the pharmacy.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="auth-form">
+          <div className="auth-inner">
+            <div className="eyebrow" style={{ marginBottom: 6 }}>
+              {mode === "signup" && !users.length
+                ? "First run"
+                : mode === "reset"
+                  ? "Account recovery"
+                  : "Staff access"}
+            </div>
+            <h2 style={{ fontSize: 26, margin: "0 0 18px" }}>{title}</h2>
+
+            {err && (
+              <div className="banner b-bad" style={{ marginBottom: 14 }}>
+                <AlertTriangle size={16} />
+                <span>{err}</span>
+              </div>
+            )}
+            {ok && (
+              <div className="banner b-ok" style={{ marginBottom: 14 }}>
+                <CheckCircle2 size={16} />
+                <span>{ok}</span>
+              </div>
+            )}
+
+            <div style={{ display: "grid", gap: 13 }}>
+              {mode === "signup" && (
+                <>
+                  <Field label="Full name">
+                    <Input
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Dr. A. Sharma"
+                    />
+                  </Field>
+                  {!users.length && (
+                    <Field label="Pharmacy / hospital name">
+                      <Input
+                        value={pharmacy}
+                        onChange={(e) => setPharmacy(e.target.value)}
+                        placeholder="City Hospital Pharmacy, Rohtak"
+                      />
+                    </Field>
+                  )}
+                  <Field label="Role">
+                    <select
+                      value={role}
+                      onChange={(e) => setRole(e.target.value)}
+                    >
+                      <option value="Chief Pharmacist">
+                        Chief Pharmacist (Admin)
+                      </option>
+                      <option value="Pharmacist">Pharmacist</option>
+                      <option value="Doctor">Doctor</option>
+                    </select>
+                  </Field>
+                  <Field label="Email">
+                    <Input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="name@hospital.in"
+                    />
+                  </Field>
+                  <div className="grid g2">
+                    <Field label="Password" hint="8 characters minimum">
+                      <Input
+                        type="password"
+                        value={pw}
+                        onChange={(e) => setPw(e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Repeat password">
+                      <Input
+                        type="password"
+                        value={pw2}
+                        onChange={(e) => setPw2(e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  <Field label="Security question">
+                    <select value={q} onChange={(e) => setQ(e.target.value)}>
+                      <option>Which city was your first posting in?</option>
+                      <option>What is your pharmacy licence number?</option>
+                      <option>What was the name of your first school?</option>
+                      <option>What is your mother's maiden name?</option>
+                    </select>
+                  </Field>
+                  <Field
+                    label="Answer"
+                    hint="Used to reset the password if it's forgotten."
+                  >
+                    <Input value={a} onChange={(e) => setA(e.target.value)} />
+                  </Field>
+                  <button
+                    className="btn p full"
+                    disabled={busy}
+                    onClick={submitSignup}
+                  >
+                    {busy ? (
+                      <Loader2 size={16} className="spin" />
+                    ) : (
+                      <ShieldCheck size={16} />
+                    )}{" "}
+                    Create account
+                  </button>
+                  {!!users.length && (
+                    <div style={{ textAlign: "center" }}>
+                      <button
+                        className="link"
+                        onClick={() => {
+                          setMode("login");
+                          say("");
+                        }}
+                      >
+                        Back to sign in
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {mode === "login" && (
+                <>
+                  <Field label="Email">
+                    <Input
+                      type="email"
+                      value={email}
+                      autoComplete="username"
+                      onChange={(e) => setEmail(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && submitLogin()}
+                    />
+                  </Field>
+                  <Field label="Password">
+                    <Input
+                      type="password"
+                      value={pw}
+                      autoComplete="current-password"
+                      onChange={(e) => setPw(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && submitLogin()}
+                    />
+                  </Field>
+                  <button
+                    className="btn p full"
+                    disabled={busy}
+                    onClick={submitLogin}
+                  >
+                    {busy ? "Checking…" : "Sign in"}
+                  </button>
+                  <div
+                    style={{ display: "flex", justifyContent: "space-between" }}
+                  >
+                    <button
+                      className="link"
+                      onClick={() => {
+                        setMode("reset");
+                        setRStage(1);
+                        say("");
+                      }}
+                    >
+                      Forgot password?
+                    </button>
+                    <button
+                      className="link"
+                      onClick={() => {
+                        setMode("signup");
+                        say("");
+                      }}
+                    >
+                      Create an account
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {mode === "reset" && (
+                <>
+                  {rStage === 1 && (
+                    <>
+                      <Field label="Email on the account">
+                        <Input
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                        />
+                      </Field>
+                      <button className="btn p full" onClick={findUser}>
+                        <KeyRound size={16} /> Continue
+                      </button>
+                    </>
+                  )}
+                  {rStage === 2 && (
+                    <>
+                      <div
+                        className="card"
+                        style={{ padding: 12, background: "#F7FAFB" }}
+                      >
+                        <div className="eyebrow">Security question</div>
+                        <div style={{ fontWeight: 600 }}>{rUser.q}</div>
+                      </div>
+                      <Field label="Your answer">
+                        <Input
+                          value={rAns}
+                          onChange={(e) => setRAns(e.target.value)}
+                        />
+                      </Field>
+                      <Field label="New password">
+                        <Input
+                          type="password"
+                          value={pw}
+                          onChange={(e) => setPw(e.target.value)}
+                        />
+                      </Field>
+                      <Field label="Repeat new password">
+                        <Input
+                          type="password"
+                          value={pw2}
+                          onChange={(e) => setPw2(e.target.value)}
+                        />
+                      </Field>
+                      <button
+                        className="btn p full"
+                        disabled={busy}
+                        onClick={doReset}
+                      >
+                        Update password
+                      </button>
+                    </>
+                  )}
+                  <div style={{ textAlign: "center" }}>
+                    <button
+                      className="link"
+                      onClick={() => {
+                        setMode("login");
+                        say("");
+                      }}
+                    >
+                      Back to sign in
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <p style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 22 }}>
+              Passwords are salted and hashed with SHA-256 before they're
+              stored. For a live hospital deployment, move this to a server with
+              bcrypt or Argon2 — see the notes that came with this file.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   MEDICINE TYPE-AHEAD
+   ============================================================ */
+function MedicineSearch({
+  value,
+  onChange,
+  onPick,
+  stock,
+  placeholder,
+  autoFocus,
+}) {
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0);
+  const box = useRef(null);
+
+  useEffect(() => {
+    const h = (e) => {
+      if (box.current && !box.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const results = useMemo(() => {
+    const q = (value || "").trim().toLowerCase();
+    if (q.length < 2) return [];
+    const out = [];
+    CATALOG.forEach((c) => {
+      const hitG = c.g.toLowerCase().includes(q);
+      const hitB = c.brands.some((b) => b.toLowerCase().includes(q));
+      if (!hitG && !hitB) return;
+      c.forms.forEach((f) =>
+        f.strengths.forEach((s) => {
+          const batches = stock.filter(
+            (it) => it.name === c.g && it.form === f.form && it.strength === s,
+          );
+          const qty = batches.reduce(
+            (n, b) => n + (expiryState(b.expiry).key === "expired" ? 0 : b.qty),
+            0,
+          );
+          const nearest = batches
+            .filter((b) => expiryState(b.expiry).key !== "expired")
+            .sort((a, b) => new Date(a.expiry) - new Date(b.expiry))[0];
+          out.push({
+            g: c.g,
+            brands: c.brands,
+            cls: c.cls,
+            sch: c.sch,
+            form: f.form,
+            strength: s,
+            qty,
+            nearest,
+            batches,
+          });
+        }),
+      );
+    });
+    out.sort((a, b) => (b.qty > 0) - (a.qty > 0) || a.g.localeCompare(b.g));
+    return out.slice(0, 30);
+  }, [value, stock]);
+
+  useEffect(() => {
+    setHi(0);
+  }, [value]);
+
+  const choose = (r) => {
+    onPick(r);
+    setOpen(false);
+  };
+
+  return (
+    <div className="sugg-wrap" ref={box}>
+      <div style={{ position: "relative" }}>
+        <Search
+          size={15}
+          style={{
+            position: "absolute",
+            left: 10,
+            top: 11,
+            color: "var(--muted)",
+          }}
+        />
+        <input
+          style={{
+            paddingLeft: 32,
+            border: "1px solid var(--line)",
+            borderRadius: 2,
+            padding: "9px 10px 9px 32px",
+            width: "100%",
+            background: "#FCFDFE",
+          }}
+          value={value}
+          autoFocus={autoFocus}
+          placeholder={
+            placeholder || "Start typing — e.g. paracetamol, dolo, augmentin"
+          }
+          onChange={(e) => {
+            onChange(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={(e) => {
+            if (!open || !results.length) return;
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              setHi((h) => Math.min(h + 1, results.length - 1));
+            }
+            if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setHi((h) => Math.max(h - 1, 0));
+            }
+            if (e.key === "Enter") {
+              e.preventDefault();
+              choose(results[hi]);
+            }
+            if (e.key === "Escape") setOpen(false);
+          }}
+        />
+      </div>
+      {open && (value || "").trim().length >= 2 && (
+        <div className="sugg">
+          {results.length === 0 && (
+            <div style={{ padding: 14, color: "var(--muted)", fontSize: 13 }}>
+              Nothing in the drug catalog matches that. You can still enter it
+              manually below.
+            </div>
+          )}
+          {results.length > 0 && (
+            <div className="sugg-h eyebrow">
+              Did you mean — {results.length} match
+              {results.length > 1 ? "es" : ""}
+            </div>
+          )}
+          {results.map((r, i) => (
+            <div
+              key={i}
+              className={`sugg-i ${i === hi ? "hi" : ""}`}
+              onMouseEnter={() => setHi(i)}
+              onClick={() => choose(r)}
+            >
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontWeight: 600 }}>
+                  {r.g}{" "}
+                  <span className="mono" style={{ color: "var(--teal-d)" }}>
+                    {r.strength}
+                  </span>
+                  <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                    {" "}
+                    · {r.form}
+                  </span>
+                </div>
+                <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                  {r.brands.slice(0, 3).join(" · ")} — {r.cls}
+                </div>
+              </div>
+              <div style={{ textAlign: "right", flexShrink: 0 }}>
+                {r.qty > 0 ? (
+                  <>
+                    <div
+                      className="mono"
+                      style={{ fontSize: 12.5, fontWeight: 600 }}
+                    >
+                      {r.qty} {PACK_UNIT(r.form)}
+                    </div>
+                    {r.nearest && (
+                      <div style={{ fontSize: 10.5, color: "var(--muted)" }}>
+                        exp {fmtDate(r.nearest.expiry)}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <span className="tag t-mut">Out of stock</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   ADD MEDICINE - IMPROVED FOR MULTIPLE ITEMS
+   ============================================================ */
+const blank = {
+  name: "",
+  brand: "",
+  form: "Tablet",
+  strength: "",
+  qty: "",
+  batchNo: "",
+  expiry: "",
+  mrp: "",
+  cost: "",
+  gst: "12",
+  mfr: "",
+  rack: "",
+  reorder: "20",
+  cls: "",
+  sch: "OTC",
+};
+
+function AddMedicine({ stock, onAdd, user }) {
+  const [f, setF] = useState(blank);
+  const [strengths, setStrengths] = useState([]);
+  const [custom, setCustom] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [items, setItems] = useState([]);
+  const [showList, setShowList] = useState(false);
+  const set = (k) => (e) => setF((s) => ({ ...s, [k]: e.target.value }));
+
+  const pick = (r) => {
+    setF((s) => ({
+      ...s,
+      name: r.g,
+      form: r.form,
+      strength: r.strength,
+      brand: r.brands[0] || "",
+      cls: r.cls,
+      sch: r.sch,
+    }));
+    const c = CATALOG.find((x) => x.g === r.g);
+    const fm = c && c.forms.find((x) => x.form === r.form);
+    setStrengths(fm ? fm.strengths : []);
+    setCustom(false);
+  };
+
+  const existing = useMemo(
+    () =>
+      stock.filter(
+        (it) =>
+          it.name.toLowerCase() === f.name.toLowerCase() &&
+          (!f.strength || it.strength === f.strength),
+      ),
+    [stock, f.name, f.strength],
+  );
+
+  const submit = async () => {
+    if (!f.name.trim() || !f.strength.trim())
+      return setMsg({
+        t: "bad",
+        m: "Medicine name and strength are both needed.",
+      });
+    if (!f.qty || Number(f.qty) <= 0)
+      return setMsg({ t: "bad", m: "Enter how many units came in." });
+    if (!f.batchNo.trim())
+      return setMsg({
+        t: "bad",
+        m: "Batch number is required — it's how expiry is tracked.",
+      });
+    if (!f.expiry)
+      return setMsg({
+        t: "bad",
+        m: "Enter the expiry date printed on the pack.",
+      });
+    if (!f.mrp || Number(f.mrp) <= 0)
+      return setMsg({ t: "bad", m: "Enter the MRP per unit." });
+    if (daysLeft(f.expiry) < 0)
+      return setMsg({
+        t: "bad",
+        m: "That date has already passed. Expired stock shouldn't be taken in.",
+      });
+    const dup = stock.find(
+      (it) =>
+        it.batchNo.toLowerCase() === f.batchNo.trim().toLowerCase() &&
+        it.name === f.name.trim(),
+    );
+    if (dup)
+      return setMsg({
+        t: "bad",
+        m: `Batch ${f.batchNo} of ${f.name} is already on the shelf. Edit its quantity instead.`,
+      });
+
+    const newItem = {
+      id: uid(),
+      name: f.name.trim(),
+      brand: f.brand.trim(),
+      form: f.form,
+      strength: f.strength.trim(),
+      qty: Number(f.qty),
+      batchNo: f.batchNo.trim().toUpperCase(),
+      expiry: f.expiry,
+      mrp: Number(f.mrp),
+      cost: Number(f.cost || 0),
+      gst: Number(f.gst || 0),
+      mfr: f.mfr.trim(),
+      rack: f.rack.trim().toUpperCase(),
+      reorder: Number(f.reorder || 0),
+      cls: f.cls,
+      sch: f.sch,
+      addedAt: new Date().toISOString(),
+      addedBy: user.name,
+    };
+
+    setItems([...items, newItem]);
+    setMsg({ t: "ok", m: `✓ ${f.name} ${f.strength} added to cart.` });
+    setF({ ...blank, form: f.form });
+    setStrengths([]);
+    setCustom(false);
+  };
+
+  const saveAll = async () => {
+    if (!items.length)
+      return setMsg({ t: "bad", m: "Add at least one medicine to save." });
+    for (const item of items) {
+      await onAdd(item);
+    }
+    setMsg({
+      t: "ok",
+      m: `✓ ${items.length} batch${items.length > 1 ? "es" : ""} added successfully!`,
+    });
+    setItems([]);
+    setTimeout(() => setMsg(null), 3000);
+  };
+
+  const removeItem = (id) => {
+    setItems(items.filter((i) => i.id !== id));
+  };
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16, maxWidth: 1080 }}>
+      <div>
+        <div className="eyebrow">Goods inward</div>
+        <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>
+          Add stock to the shelf
+        </h2>
+      </div>
+
+      {msg && (
+        <div className={`banner ${msg.t === "ok" ? "b-ok" : "b-bad"}`}>
+          {msg.t === "ok" ? (
+            <CheckCircle2 size={16} />
+          ) : (
+            <AlertTriangle size={16} />
+          )}
+          <span>{msg.m}</span>
+        </div>
+      )}
+
+      <div
+        className="grid"
+        style={{
+          gridTemplateColumns: "minmax(0,1.7fr) minmax(0,1fr)",
+          alignItems: "start",
+          gap: 16,
+        }}
+      >
+        <div style={{ display: "grid", gap: 14 }}>
+          <div className="card">
+            <div className="card-h">
+              <Search size={15} />
+              <strong>Find the medicine</strong>
+              <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
+                Type at least 2 letters — brand names work too
+              </span>
+            </div>
+            <div className="card-b" style={{ display: "grid", gap: 12 }}>
+              <MedicineSearch
+                value={f.name}
+                onChange={(v) => setF((s) => ({ ...s, name: v }))}
+                onPick={pick}
+                stock={stock}
+                autoFocus
+              />
+
+              {existing.length > 0 && (
+                <div className="card" style={{ background: "#F7FAFB" }}>
+                  <div className="card-h" style={{ padding: "8px 12px" }}>
+                    <Package size={14} />
+                    <span className="eyebrow">
+                      Already on the shelf — {existing.length} batch
+                      {existing.length > 1 ? "es" : ""}
+                    </span>
+                  </div>
+                  <div className="scroll">
+                    <table className="tbl">
+                      <thead>
+                        <tr>
+                          <th>Strength / form</th>
+                          <th>Batch</th>
+                          <th>Qty</th>
+                          <th>Expiry</th>
+                          <th>Rack</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {existing.map((it) => (
+                          <tr key={it.id}>
+                            <td>
+                              {it.strength} · {it.form}
+                            </td>
+                            <td className="mono">{it.batchNo}</td>
+                            <td className="mono">{it.qty}</td>
+                            <td>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  gap: 8,
+                                  alignItems: "center",
+                                }}
+                              >
+                                <span className="mono">
+                                  {fmtDate(it.expiry)}
+                                </span>
+                                <ExpiryTag date={it.expiry} />
+                              </div>
+                            </td>
+                            <td className="mono">{it.rack || "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-h">
+              <Pill size={15} />
+              <strong>Batch details</strong>
+            </div>
+            <div className="card-b" style={{ display: "grid", gap: 14 }}>
+              <div className="grid g3">
+                <Field label="Medicine name">
+                  <Input
+                    value={f.name}
+                    onChange={set("name")}
+                    placeholder="Paracetamol"
+                  />
+                </Field>
+                <Field label="Brand">
+                  <Input
+                    value={f.brand}
+                    onChange={set("brand")}
+                    placeholder="Dolo"
+                  />
+                </Field>
+                <Field label="Manufacturer">
+                  <Input
+                    value={f.mfr}
+                    onChange={set("mfr")}
+                    placeholder="Micro Labs"
+                  />
+                </Field>
+              </div>
+
+              <div className="grid g3">
+                <Field label="Form">
+                  <select
+                    value={f.form}
+                    onChange={(e) => {
+                      set("form")(e);
+                      setStrengths([]);
+                      setCustom(false);
+                    }}
+                  >
+                    {FORMS.map((x) => (
+                      <option key={x}>{x}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field
+                  label="Strength"
+                  hint={
+                    /Tablet|Capsule/.test(f.form)
+                      ? "e.g. 500 mg, 650 mg"
+                      : /Syrup|Solution/.test(f.form)
+                        ? "e.g. 125 mg/5 ml"
+                        : /Tube/.test(f.form)
+                          ? "e.g. 1% w/w"
+                          : "e.g. 2 mg/ml"
+                  }
+                >
+                  {strengths.length && !custom ? (
+                    <select
+                      value={f.strength}
+                      onChange={(e) => {
+                        if (e.target.value === "__") {
+                          setCustom(true);
+                          setF((s) => ({ ...s, strength: "" }));
+                        } else set("strength")(e);
+                      }}
+                    >
+                      <option value="">Select strength…</option>
+                      {strengths.map((s) => (
+                        <option key={s}>{s}</option>
+                      ))}
+                      <option value="__">Other — type it in</option>
+                    </select>
+                  ) : (
+                    <Input
+                      value={f.strength}
+                      onChange={set("strength")}
+                      placeholder="500 mg"
+                    />
+                  )}
+                </Field>
+                <Field label={`Quantity received (${PACK_UNIT(f.form)})`}>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={f.qty}
+                    onChange={set("qty")}
+                    placeholder="100"
+                  />
+                </Field>
+              </div>
+
+              <div className="grid g3">
+                <Field label="Batch number" hint="Printed on the carton">
+                  <Input
+                    value={f.batchNo}
+                    onChange={set("batchNo")}
+                    placeholder="DL2419"
+                  />
+                </Field>
+                <Field
+                  label="Expiry date"
+                  hint={
+                    f.expiry
+                      ? `${daysLeft(f.expiry)} days of shelf life`
+                      : "From the pack"
+                  }
+                >
+                  <Input
+                    type="date"
+                    value={f.expiry}
+                    onChange={set("expiry")}
+                  />
+                </Field>
+                <Field label="Rack / shelf">
+                  <Input
+                    value={f.rack}
+                    onChange={set("rack")}
+                    placeholder="A-01"
+                  />
+                </Field>
+              </div>
+
+              <div className="grid g4">
+                <Field label="MRP per unit (₹)">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    value={f.mrp}
+                    onChange={set("mrp")}
+                    placeholder="2.10"
+                  />
+                </Field>
+                <Field label="Purchase cost (₹)">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    value={f.cost}
+                    onChange={set("cost")}
+                    placeholder="1.62"
+                  />
+                </Field>
+                <Field label="GST %">
+                  <select value={f.gst} onChange={set("gst")}>
+                    {["0", "5", "12", "18"].map((x) => (
+                      <option key={x} value={x}>
+                        {x}%
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Reorder level" hint="Alerts below this">
+                  <Input
+                    type="number"
+                    value={f.reorder}
+                    onChange={set("reorder")}
+                  />
+                </Field>
+              </div>
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button className="btn p" onClick={submit}>
+                  <Plus size={16} /> Add to cart
+                </button>
+                <button
+                  className="btn g"
+                  onClick={() => {
+                    setF(blank);
+                    setStrengths([]);
+                    setCustom(false);
+                    setMsg(null);
+                  }}
+                >
+                  Clear form
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gap: 14 }}>
+          <div className="card">
+            <div className="card-h">
+              <strong>Items to add</strong>
+              <span className="eyebrow">
+                {items.length} item{items.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            {items.length === 0 ? (
+              <div className="empty" style={{ padding: 30 }}>
+                <Pill size={26} />
+                <p>Add medicines above — they'll appear here.</p>
+              </div>
+            ) : (
+              <div className="scroll">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Medicine</th>
+                      <th>Batch</th>
+                      <th>Qty</th>
+                      <th>Expiry</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((item) => (
+                      <tr key={item.id}>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{item.name}</div>
+                          <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                            {item.brand} · {item.strength}
+                          </div>
+                        </td>
+                        <td className="mono">{item.batchNo}</td>
+                        <td className="mono">{item.qty}</td>
+                        <td className="mono">{fmtDate(item.expiry)}</td>
+                        <td>
+                          <button
+                            className="btn sm g"
+                            onClick={() => removeItem(item.id)}
+                          >
+                            <X size={14} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {items.length > 0 && (
+              <div
+                style={{
+                  borderTop: "1px solid var(--line2)",
+                  padding: "12px 16px",
+                  display: "flex",
+                  gap: 10,
+                }}
+              >
+                <button className="btn p" onClick={saveAll} style={{ flex: 1 }}>
+                  <CheckCircle2 size={15} /> Save all
+                </button>
+                <button
+                  className="btn g"
+                  onClick={() => setItems([])}
+                  style={{ flex: 1 }}
+                >
+                  Clear cart
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   INVENTORY
+   ============================================================ */
+function Inventory({ stock, onDelete, onAdjust }) {
+  const [q, setQ] = useState("");
+  const [form, setForm] = useState("All");
+  const [sort, setSort] = useState("expiry");
+
+  const rows = useMemo(() => {
+    let r = stock.filter((it) => {
+      const t =
+        `${it.name} ${it.brand} ${it.batchNo} ${it.strength} ${it.mfr}`.toLowerCase();
+      return (
+        t.includes(q.toLowerCase()) && (form === "All" || it.form === form)
+      );
+    });
+    r.sort((a, b) =>
+      sort === "expiry"
+        ? new Date(a.expiry) - new Date(b.expiry)
+        : sort === "qty"
+          ? a.qty - b.qty
+          : a.name.localeCompare(b.name),
+    );
+    return r;
+  }, [stock, q, form, sort]);
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-end",
+          gap: 16,
+          flexWrap: "wrap",
+        }}
+      >
+        <div>
+          <div className="eyebrow">Shelf</div>
+          <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>Stock on hand</h2>
+        </div>
+        <div
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            gap: 10,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ position: "relative" }}>
+            <Search
+              size={15}
+              style={{
+                position: "absolute",
+                left: 10,
+                top: 11,
+                color: "var(--muted)",
+              }}
+            />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search name, brand or batch"
+              style={{
+                paddingLeft: 32,
+                border: "1px solid var(--line)",
+                borderRadius: 2,
+                padding: "9px 10px 9px 32px",
+                minWidth: 250,
+                background: "#fff",
+              }}
+            />
+          </div>
+          <select
+            value={form}
+            onChange={(e) => setForm(e.target.value)}
+            style={{
+              border: "1px solid var(--line)",
+              borderRadius: 2,
+              padding: "9px 10px",
+              background: "#fff",
+            }}
+          >
+            <option>All</option>
+            {FORMS.map((x) => (
+              <option key={x}>{x}</option>
+            ))}
+          </select>
+          <select
+            value={sort}
+            onChange={(e) => setSort(e.target.value)}
+            style={{
+              border: "1px solid var(--line)",
+              borderRadius: 2,
+              padding: "9px 10px",
+              background: "#fff",
+            }}
+          >
+            <option value="expiry">Soonest expiry first</option>
+            <option value="qty">Lowest quantity first</option>
+            <option value="name">Name A–Z</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="scroll">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Medicine</th>
+                <th>Form / strength</th>
+                <th>Batch</th>
+                <th>Shelf life</th>
+                <th>Expiry</th>
+                <th>Qty</th>
+                <th>MRP</th>
+                <th>Rack</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((it) => {
+                const st = expiryState(it.expiry);
+                const low = it.qty <= it.reorder;
+                return (
+                  <tr
+                    key={it.id}
+                    style={
+                      st.key === "expired"
+                        ? { background: "var(--red-l)" }
+                        : undefined
+                    }
+                  >
+                    <td>
+                      <div style={{ fontWeight: 600 }}>{it.name}</div>
+                      <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                        {it.brand || "—"} · {it.mfr || "—"}
+                      </div>
+                    </td>
+                    <td>
+                      <span className="mono">{it.strength}</span>
+                      <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                        {it.form}
+                      </div>
+                    </td>
+                    <td className="mono">{it.batchNo}</td>
+                    <td style={{ minWidth: 90 }}>
+                      <LifeBar date={it.expiry} addedAt={it.addedAt} />
+                    </td>
+                    <td>
+                      <div className="mono">{fmtDate(it.expiry)}</div>
+                      <ExpiryTag date={it.expiry} />
+                    </td>
+                    <td>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                        }}
+                      >
+                        <button
+                          className="btn sm"
+                          onClick={() => onAdjust(it.id, -1)}
+                          disabled={it.qty <= 0}
+                        >
+                          −
+                        </button>
+                        <span
+                          className="mono"
+                          style={{
+                            minWidth: 34,
+                            textAlign: "center",
+                            fontWeight: 600,
+                            color: low ? "var(--amber)" : undefined,
+                          }}
+                        >
+                          {it.qty}
+                        </span>
+                        <button
+                          className="btn sm"
+                          onClick={() => onAdjust(it.id, 1)}
+                        >
+                          +
+                        </button>
+                      </div>
+                      {low && (
+                        <span className="tag t-warn" style={{ marginTop: 4 }}>
+                          Reorder
+                        </span>
+                      )}
+                    </td>
+                    <td className="mono">{money(it.mrp)}</td>
+                    <td className="mono">{it.rack || "—"}</td>
+                    <td>
+                      <button
+                        className="btn sm g"
+                        title="Remove batch from shelf"
+                        onClick={() => onDelete(it.id)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {!rows.length && (
+          <div className="empty">
+            <Boxes size={26} />
+            <p>
+              Nothing matches that search. Try a different name or clear the
+              filters.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BILLING
+   ============================================================ */
+function Billing({ stock, user, pharmacy, bills, onBill }) {
+  const [q, setQ] = useState("");
+  const [picked, setPicked] = useState(null);
+  const [cart, setCart] = useState([]);
+  const [patient, setPatient] = useState("");
+  const [uhid, setUhid] = useState("");
+  const [doctor, setDoctor] = useState("");
+  const [disc, setDisc] = useState("0");
+  const [pay, setPay] = useState("Cash");
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(null);
+
+  const addBatch = (b, n = 1) => {
+    if (expiryState(b.expiry).key === "expired") {
+      setErr(
+        `Batch ${b.batchNo} expired on ${fmtDate(b.expiry)}. It can't be dispensed — move it to the expiry desk.`,
+      );
+      return;
+    }
+    const e = cart.find((x) => x.id === b.id);
+    if (e && e.qty + n > b.qty) {
+      setErr(
+        `Only ${b.qty} ${PACK_UNIT(b.form)} of batch ${b.batchNo} are on the shelf.`,
+      );
+      return;
+    }
+    setErr("");
+    setCart((c) =>
+      e
+        ? c.map((x) => (x.id === b.id ? { ...x, qty: x.qty + n } : x))
+        : [
+            ...c,
+            {
+              id: b.id,
+              name: b.name,
+              brand: b.brand,
+              form: b.form,
+              strength: b.strength,
+              batchNo: b.batchNo,
+              expiry: b.expiry,
+              mrp: b.mrp,
+              gst: b.gst,
+              qty: n,
+              stock: b.qty,
+            },
+          ],
+    );
+    setPicked(null);
+    setQ("");
+  };
+
+  const setQty = (id, v) => {
+    const line = cart.find((x) => x.id === id);
+    if (!line) return;
+    const s = stock.find((i) => i.id === id);
+    const max = s ? s.qty : line.stock;
+    const n = Math.max(1, Math.min(Number(v) || 1, max));
+    setErr(
+      Number(v) > max
+        ? `Only ${max} ${PACK_UNIT(line.form)} left in batch ${line.batchNo}.`
+        : "",
+    );
+    setCart((c) => c.map((x) => (x.id === id ? { ...x, qty: n } : x)));
+  };
+
+  const totals = useMemo(() => {
+    let sub = 0,
+      gst = 0;
+    cart.forEach((l) => {
+      const line = l.mrp * l.qty;
+      const base = line / (1 + l.gst / 100);
+      sub += base;
+      gst += line - base;
+    });
+    const gross = sub + gst;
+    const d = Math.min(Number(disc) || 0, 100);
+    const dAmt = gross * (d / 100);
+    return { sub, gst, gross, dAmt, net: gross - dAmt };
+  }, [cart, disc]);
+
+  const finish = async () => {
+    if (!cart.length) return setErr("Add at least one medicine to the bill.");
+    if (!patient.trim())
+      return setErr("Enter the patient's name for the dispensing record.");
+    const no = `${(pharmacy || "RX").slice(0, 2).toUpperCase()}/${new Date().getFullYear()}/${String(bills.length + 1).padStart(4, "0")}`;
+    const bill = {
+      id: uid(),
+      no,
+      at: new Date().toISOString(),
+      patient: patient.trim(),
+      uhid: uhid.trim(),
+      doctor: doctor.trim(),
+      pay,
+      by: user.name,
+      pharmacy,
+      lines: cart.map((l) => ({ ...l })),
+      sub: totals.sub,
+      gstTotal: totals.gst,
+      discPct: Number(disc) || 0,
+      discAmt: totals.dAmt,
+      net: totals.net,
+    };
+    await onBill(bill);
+    setDone(bill);
+    setCart([]);
+    setPatient("");
+    setUhid("");
+    setDoctor("");
+    setDisc("0");
+    setErr("");
+  };
+
+  const live = stock.filter((s) => s.qty > 0);
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16 }}>
+      <div>
+        <div className="eyebrow">Counter</div>
+        <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>Dispense &amp; bill</h2>
+      </div>
+
+      {err && (
+        <div className="banner b-bad">
+          <AlertTriangle size={16} />
+          <span>{err}</span>
+        </div>
+      )}
+
+      <div
+        className="grid"
+        style={{
+          gridTemplateColumns: "minmax(0,1.7fr) minmax(0,1fr)",
+          alignItems: "start",
+        }}
+      >
+        <div style={{ display: "grid", gap: 14 }}>
+          <div className="card">
+            <div className="card-h">
+              <Search size={15} />
+              <strong>Add medicine</strong>
+            </div>
+            <div className="card-b" style={{ display: "grid", gap: 12 }}>
+              <MedicineSearch
+                value={q}
+                onChange={setQ}
+                stock={live}
+                onPick={(r) => setPicked(r)}
+                placeholder="Type the medicine — e.g. paracetamol"
+              />
+              {picked && (
+                <div className="card" style={{ background: "#F7FAFB" }}>
+                  <div className="card-h" style={{ padding: "9px 12px" }}>
+                    <strong>
+                      {picked.g} {picked.strength} · {picked.form}
+                    </strong>
+                    <button
+                      className="btn sm g"
+                      style={{ marginLeft: "auto" }}
+                      onClick={() => setPicked(null)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                  <div className="card-b" style={{ padding: 0 }}>
+                    {picked.batches.length === 0 ? (
+                      <div style={{ padding: 14, color: "var(--muted)" }}>
+                        No batches of this on the shelf. Add it under Add stock
+                        first.
+                      </div>
+                    ) : (
+                      <table className="tbl">
+                        <thead>
+                          <tr>
+                            <th>Batch</th>
+                            <th>Expiry</th>
+                            <th>Available</th>
+                            <th>MRP</th>
+                            <th></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {picked.batches
+                            .sort(
+                              (a, b) => new Date(a.expiry) - new Date(b.expiry),
+                            )
+                            .map((b) => {
+                              const st = expiryState(b.expiry);
+                              return (
+                                <tr key={b.id}>
+                                  <td className="mono">{b.batchNo}</td>
+                                  <td>
+                                    <span className="mono">
+                                      {fmtDate(b.expiry)}
+                                    </span>{" "}
+                                    <ExpiryTag date={b.expiry} />
+                                  </td>
+                                  <td className="mono">{b.qty}</td>
+                                  <td className="mono">{money(b.mrp)}</td>
+                                  <td>
+                                    <button
+                                      className="btn sm p"
+                                      disabled={
+                                        st.key === "expired" || b.qty <= 0
+                                      }
+                                      onClick={() => addBatch(b)}
+                                    >
+                                      <Plus size={13} /> Add
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                  <div
+                    style={{
+                      padding: "8px 12px",
+                      borderTop: "1px solid var(--line2)",
+                      fontSize: 11.5,
+                      color: "var(--muted)",
+                    }}
+                  >
+                    Oldest batch listed first — dispense that one to keep stock
+                    rotating.
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-h">
+              <Receipt size={15} />
+              <strong>On this bill</strong>
+              <span className="eyebrow" style={{ marginLeft: "auto" }}>
+                {cart.length} line{cart.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            {cart.length === 0 ? (
+              <div className="empty">
+                <Receipt size={26} />
+                <p>
+                  No medicines yet. Search above and pick a batch to start the
+                  bill.
+                </p>
+              </div>
+            ) : (
+              <div className="scroll">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Medicine</th>
+                      <th>Batch / expiry</th>
+                      <th>Qty</th>
+                      <th>Rate</th>
+                      <th>Amount</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cart.map((l) => (
+                      <tr key={l.id}>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>
+                            {l.name}{" "}
+                            <span
+                              className="mono"
+                              style={{ color: "var(--teal-d)" }}
+                            >
+                              {l.strength}
+                            </span>
+                          </div>
+                          <div
+                            style={{ fontSize: 11.5, color: "var(--muted)" }}
+                          >
+                            {l.brand} · {l.form} · GST {l.gst}%
+                          </div>
+                        </td>
+                        <td>
+                          <div className="mono">{l.batchNo}</div>
+                          <div
+                            style={{ fontSize: 11.5, color: "var(--muted)" }}
+                          >
+                            {fmtDate(l.expiry)}
+                          </div>
+                        </td>
+                        <td>
+                          <input
+                            type="number"
+                            min="1"
+                            value={l.qty}
+                            onChange={(e) => setQty(l.id, e.target.value)}
+                            className="mono"
+                            style={{
+                              width: 66,
+                              border: "1px solid var(--line)",
+                              borderRadius: 2,
+                              padding: "6px 8px",
+                            }}
+                          />
+                        </td>
+                        <td className="mono">{money(l.mrp)}</td>
+                        <td className="mono" style={{ fontWeight: 600 }}>
+                          {money(l.mrp * l.qty)}
+                        </td>
+                        <td>
+                          <button
+                            className="btn sm g"
+                            onClick={() =>
+                              setCart((c) => c.filter((x) => x.id !== l.id))
+                            }
+                          >
+                            <X size={14} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gap: 14 }}>
+          <div className="card">
+            <div className="card-h">
+              <strong>Patient</strong>
+            </div>
+            <div className="card-b" style={{ display: "grid", gap: 12 }}>
+              <Field label="Patient name">
+                <Input
+                  value={patient}
+                  onChange={(e) => setPatient(e.target.value)}
+                  placeholder="Ramesh Kumar"
+                />
+              </Field>
+              <Field label="UHID / OPD number">
+                <Input
+                  value={uhid}
+                  onChange={(e) => setUhid(e.target.value)}
+                  placeholder="UH-10429"
+                />
+              </Field>
+              <Field label="Prescribing doctor">
+                <Input
+                  value={doctor}
+                  onChange={(e) => setDoctor(e.target.value)}
+                  placeholder="Dr. Meena Rathi"
+                />
+              </Field>
+              <Field label="Payment">
+                <select value={pay} onChange={(e) => setPay(e.target.value)}>
+                  <option>Cash</option>
+                  <option>UPI</option>
+                  <option>Card</option>
+                  <option>Insurance / TPA</option>
+                  <option>Charged to IP bill</option>
+                </select>
+              </Field>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-h">
+              <strong>Total</strong>
+            </div>
+            <div className="card-b" style={{ display: "grid", gap: 9 }}>
+              <div
+                className="row"
+                style={{ display: "flex", justifyContent: "space-between" }}
+              >
+                <span style={{ color: "var(--muted)" }}>Taxable value</span>
+                <span className="mono">{money(totals.sub)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--muted)" }}>GST</span>
+                <span className="mono">{money(totals.gst)}</span>
+              </div>
+              <Field label="Discount %">
+                <Input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={disc}
+                  onChange={(e) => setDisc(e.target.value)}
+                />
+              </Field>
+              {totals.dAmt > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    color: "var(--amber)",
+                  }}
+                >
+                  <span>Discount</span>
+                  <span className="mono">− {money(totals.dAmt)}</span>
+                </div>
+              )}
+              <div
+                className="perf"
+                style={{
+                  paddingTop: 10,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "baseline",
+                }}
+              >
+                <strong>Payable</strong>
+                <span
+                  className="disp mono"
+                  style={{ fontSize: 26, fontWeight: 600 }}
+                >
+                  {money(totals.net)}
+                </span>
+              </div>
+              <button
+                className="btn p full"
+                onClick={finish}
+                disabled={!cart.length}
+              >
+                <Receipt size={16} /> Generate bill
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {done && <BillModal bill={done} onClose={() => setDone(null)} />}
+    </div>
+  );
+}
+
+/* ============================================================
+   BILL RECEIPT MODAL
+   ============================================================ */
+function BillModal({ bill, onClose }) {
+  return (
+    <div className="ov" onClick={onClose}>
+      <div
+        className="modal"
+        style={{ maxWidth: 460 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="card-h no-print">
+          <CheckCircle2 size={16} color="var(--teal)" />
+          <strong>Bill {bill.no}</strong>
+          <button
+            className="btn sm g"
+            style={{ marginLeft: "auto" }}
+            onClick={onClose}
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <div className="receipt print-me">
+          <div style={{ textAlign: "center" }}>
+            <div
+              style={{ fontWeight: 600, fontSize: 14, letterSpacing: ".06em" }}
+            >
+              {(bill.pharmacy || "HOSPITAL PHARMACY").toUpperCase()}
+            </div>
+            <div>Tax invoice — pharmacy counter</div>
+          </div>
+          <hr />
+          <div className="row">
+            <span>Bill no</span>
+            <span>{bill.no}</span>
+          </div>
+          <div className="row">
+            <span>Date</span>
+            <span>{new Date(bill.at).toLocaleString("en-IN")}</span>
+          </div>
+          <div className="row">
+            <span>Patient</span>
+            <span>{bill.patient}</span>
+          </div>
+          {bill.uhid && (
+            <div className="row">
+              <span>UHID</span>
+              <span>{bill.uhid}</span>
+            </div>
+          )}
+          {bill.doctor && (
+            <div className="row">
+              <span>Doctor</span>
+              <span>{bill.doctor}</span>
+            </div>
+          )}
+          <div className="row">
+            <span>Dispensed by</span>
+            <span>{bill.by}</span>
+          </div>
+          <hr />
+          {bill.lines.map((l, i) => (
+            <div key={i} style={{ marginBottom: 7 }}>
+              <div>
+                {i + 1}. {l.name} {l.strength}
+              </div>
+              <div style={{ color: "#555" }}>
+                {" "}
+                {l.form} · B/N {l.batchNo} · Exp {fmtDate(l.expiry)}
+              </div>
+              <div className="row">
+                <span>
+                  {" "}
+                  {l.qty} × {money(l.mrp)}
+                </span>
+                <span>{money(l.qty * l.mrp)}</span>
+              </div>
+            </div>
+          ))}
+          <hr />
+          <div className="row">
+            <span>Taxable value</span>
+            <span>{money(bill.sub)}</span>
+          </div>
+          <div className="row">
+            <span>CGST + SGST</span>
+            <span>{money(bill.gstTotal)}</span>
+          </div>
+          {bill.discAmt > 0 && (
+            <div className="row">
+              <span>Discount ({bill.discPct}%)</span>
+              <span>− {money(bill.discAmt)}</span>
+            </div>
+          )}
+          <hr />
+          <div className="row" style={{ fontWeight: 600, fontSize: 14 }}>
+            <span>PAYABLE</span>
+            <span>{money(bill.net)}</span>
+          </div>
+          <div className="row">
+            <span>Paid by</span>
+            <span>{bill.pay}</span>
+          </div>
+          <hr />
+          <div style={{ textAlign: "center", color: "#555" }}>
+            Medicines once sold are not returnable.
+            <br />
+            Check the expiry date before use.
+          </div>
+        </div>
+        <div
+          className="card-b no-print"
+          style={{
+            display: "flex",
+            gap: 10,
+            borderTop: "1px solid var(--line2)",
+          }}
+        >
+          <button className="btn p" onClick={() => window.print()}>
+            <Printer size={15} /> Print
+          </button>
+          <button className="btn" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BILL HISTORY
+   ============================================================ */
+function Bills({ bills }) {
+  const [open, setOpen] = useState(null);
+  const [q, setQ] = useState("");
+  const rows = bills
+    .filter((b) =>
+      `${b.no} ${b.patient} ${b.doctor}`
+        .toLowerCase()
+        .includes(q.toLowerCase()),
+    )
+    .sort((a, b) => new Date(b.at) - new Date(a.at));
+  const total = bills.reduce((n, b) => n + b.net, 0);
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-end",
+          gap: 16,
+          flexWrap: "wrap",
+        }}
+      >
+        <div>
+          <div className="eyebrow">Records</div>
+          <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>
+            Dispensing history
+          </h2>
+        </div>
+        <div style={{ marginLeft: "auto" }}>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Bill no, patient or doctor"
+            style={{
+              border: "1px solid var(--line)",
+              borderRadius: 2,
+              padding: "9px 10px",
+              minWidth: 240,
+              background: "#fff",
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="grid g3">
+        <Stat label="Bills raised" value={bills.length} />
+        <Stat label="Value dispensed" value={money(total)} />
+        <Stat
+          label="Average bill"
+          value={money(bills.length ? total / bills.length : 0)}
+        />
+      </div>
+
+      <div className="card">
+        <div className="scroll">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Bill no</th>
+                <th>Date</th>
+                <th>Patient</th>
+                <th>Doctor</th>
+                <th>Items</th>
+                <th>Amount</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((b) => (
+                <tr key={b.id}>
+                  <td className="mono" style={{ fontWeight: 600 }}>
+                    {b.no}
+                  </td>
+                  <td className="mono">
+                    {new Date(b.at).toLocaleDateString("en-IN")}
+                  </td>
+                  <td>
+                    {b.patient}
+                    <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                      {b.uhid || "—"}
+                    </div>
+                  </td>
+                  <td>{b.doctor || "—"}</td>
+                  <td className="mono">{b.lines.length}</td>
+                  <td className="mono" style={{ fontWeight: 600 }}>
+                    {money(b.net)}
+                  </td>
+                  <td>
+                    <button className="btn sm" onClick={() => setOpen(b)}>
+                      View <ChevronRight size={13} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!rows.length && (
+          <div className="empty">
+            <Receipt size={26} />
+            <p>
+              No bills yet. They'll appear here as soon as the counter starts
+              dispensing.
+            </p>
+          </div>
+        )}
+      </div>
+      {open && <BillModal bill={open} onClose={() => setOpen(null)} />}
+    </div>
+  );
+}
+
+/* ============================================================
+   EXPIRY DESK
+   ============================================================ */
+function Expiry({ stock, onDelete }) {
+  const groups = useMemo(() => {
+    const g = { expired: [], critical: [], warning: [] };
+    stock.forEach((it) => {
+      const k = expiryState(it.expiry).key;
+      if (g[k]) g[k].push(it);
+    });
+    Object.values(g).forEach((a) =>
+      a.sort((x, y) => new Date(x.expiry) - new Date(y.expiry)),
+    );
+    return g;
+  }, [stock]);
+
+  const lossValue = groups.expired.reduce(
+    (n, i) => n + i.qty * (i.cost || i.mrp),
+    0,
+  );
+
+  const Block = ({ title, note, items, tone, action }) => (
+    <div className="card">
+      <div className="card-h">
+        <strong>{title}</strong>
+        <span className="eyebrow">
+          {items.length} batch{items.length === 1 ? "" : "es"}
+        </span>
+        <span
+          style={{ color: "var(--muted)", fontSize: 12.5, marginLeft: "auto" }}
+        >
+          {note}
+        </span>
+      </div>
+      {items.length === 0 ? (
+        <div className="empty" style={{ padding: 26 }}>
+          Nothing here — good.
+        </div>
+      ) : (
+        <div className="scroll">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Medicine</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Qty</th>
+                <th>Rack</th>
+                <th>Value</th>
+                {action && <th></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((it) => (
+                <tr key={it.id}>
+                  <td>
+                    <div style={{ fontWeight: 600 }}>
+                      {it.name} <span className="mono">{it.strength}</span>
+                    </div>
+                    <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                      {it.brand} · {it.form}
+                    </div>
+                  </td>
+                  <td className="mono">{it.batchNo}</td>
+                  <td>
+                    <span className="mono">{fmtDate(it.expiry)}</span>{" "}
+                    <ExpiryTag date={it.expiry} />
+                  </td>
+                  <td className="mono">{it.qty}</td>
+                  <td className="mono">{it.rack || "—"}</td>
+                  <td className="mono">
+                    {money(it.qty * (it.cost || it.mrp))}
+                  </td>
+                  {action && (
+                    <td>
+                      <button
+                        className="btn sm d"
+                        onClick={() => onDelete(it.id)}
+                      >
+                        <Trash2 size={13} /> Pull from shelf
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16 }}>
+      <div>
+        <div className="eyebrow">Quality control</div>
+        <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>Expiry desk</h2>
+      </div>
+
+      {groups.expired.length > 0 && (
+        <div className="banner b-bad">
+          <AlertTriangle size={16} />
+          <span>
+            <strong>
+              {groups.expired.length} expired batch
+              {groups.expired.length === 1 ? "" : "es"} still on the shelf.
+            </strong>{" "}
+            Pull them today — write-off value {money(lossValue)}. The counter
+            already blocks them from being billed.
+          </span>
+        </div>
+      )}
+
+      <div className="grid g3">
+        <Stat
+          label="Expired"
+          value={groups.expired.length}
+          sub="Remove immediately"
+          tone={groups.expired.length ? "bad" : undefined}
+        />
+        <Stat
+          label="Expiring in 30 days"
+          value={groups.critical.length}
+          sub="Return to supplier or use first"
+          tone={groups.critical.length ? "warn" : undefined}
+        />
+        <Stat
+          label="Expiring in 90 days"
+          value={groups.warning.length}
+          sub="Watch and rotate"
+        />
+      </div>
+
+      <Block
+        title="Expired — pull from shelf"
+        note="Cannot be dispensed"
+        items={groups.expired}
+        action
+      />
+      <Block
+        title="Expiring within 30 days"
+        note="Dispense first or return"
+        items={groups.critical}
+        action
+      />
+      <Block
+        title="Expiring within 90 days"
+        note="Rotate to the front"
+        items={groups.warning}
+      />
+    </div>
+  );
+}
+
+/* ============================================================
+   DASHBOARD
+   ============================================================ */
+function Dashboard({ stock, bills, user, go }) {
+  const expired = stock.filter((i) => expiryState(i.expiry).key === "expired");
+  const soon = stock.filter((i) =>
+    ["critical"].includes(expiryState(i.expiry).key),
+  );
+  const low = stock.filter(
+    (i) => i.qty <= i.reorder && expiryState(i.expiry).key !== "expired",
+  );
+  const value = stock.reduce((n, i) => n + i.qty * (i.cost || i.mrp), 0);
+  const todayStr = new Date().toDateString();
+  const todayBills = bills.filter(
+    (b) => new Date(b.at).toDateString() === todayStr,
+  );
+  const todaySale = todayBills.reduce((n, b) => n + b.net, 0);
+
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16 }}>
+      <div>
+        <div className="eyebrow">
+          Counter open ·{" "}
+          {new Date().toLocaleDateString("en-IN", {
+            weekday: "long",
+            day: "numeric",
+            month: "long",
+          })}
+        </div>
+        <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>
+          Good to see you, {user.name.split(" ")[0]}
+        </h2>
+      </div>
+
+      {expired.length > 0 && (
+        <div className="banner b-bad">
+          <AlertTriangle size={16} />
+          <span>
+            {expired.length} expired batch{expired.length === 1 ? "" : "es"} on
+            the shelf.{" "}
+            <button
+              className="link"
+              style={{ color: "inherit", textDecoration: "underline" }}
+              onClick={() => go("expiry")}
+            >
+              Open the expiry desk
+            </button>
+          </span>
+        </div>
+      )}
+
+      <div className="grid g4">
+        <Stat
+          label="Batches on shelf"
+          value={stock.length}
+          sub={`${stock.reduce((n, i) => n + i.qty, 0)} units total`}
+        />
+        <Stat label="Stock value" value={money(value)} sub="At purchase cost" />
+        <Stat
+          label="Billed today"
+          value={money(todaySale)}
+          sub={`${todayBills.length} bill${todayBills.length === 1 ? "" : "s"}`}
+        />
+        <Stat
+          label="Needs attention"
+          value={expired.length + soon.length + low.length}
+          sub="Expired, expiring or low"
+          tone={
+            expired.length
+              ? "bad"
+              : soon.length || low.length
+                ? "warn"
+                : undefined
+          }
+        />
+      </div>
+
+      <div className="grid g2">
+        <div className="card">
+          <div className="card-h">
+            <CalendarClock size={15} />
+            <strong>Expiring soonest</strong>
+            <button
+              className="btn sm g"
+              style={{ marginLeft: "auto" }}
+              onClick={() => go("expiry")}
+            >
+              All <ChevronRight size={13} />
+            </button>
+          </div>
+          <div className="scroll">
+            <table className="tbl">
+              <tbody>
+                {[...stock]
+                  .sort((a, b) => new Date(a.expiry) - new Date(b.expiry))
+                  .slice(0, 6)
+                  .map((it) => (
+                    <tr key={it.id}>
+                      <td>
+                        <div style={{ fontWeight: 600 }}>
+                          {it.name} <span className="mono">{it.strength}</span>
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                          B/N {it.batchNo} · {it.qty} {PACK_UNIT(it.form)}
+                        </div>
+                      </td>
+                      <td style={{ width: 110 }}>
+                        <LifeBar date={it.expiry} addedAt={it.addedAt} />
+                      </td>
+                      <td style={{ textAlign: "right" }}>
+                        <div className="mono">{fmtDate(it.expiry)}</div>
+                        <ExpiryTag date={it.expiry} />
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+          {!stock.length && (
+            <div className="empty">
+              The shelf is empty. Add your first batch to get started.
+            </div>
+          )}
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <Package size={15} />
+            <strong>Running low</strong>
+            <button
+              className="btn sm g"
+              style={{ marginLeft: "auto" }}
+              onClick={() => go("inventory")}
+            >
+              Stock <ChevronRight size={13} />
+            </button>
+          </div>
+          {low.length === 0 ? (
+            <div className="empty" style={{ padding: 30 }}>
+              Every item is above its reorder level.
+            </div>
+          ) : (
+            <div className="scroll">
+              <table className="tbl">
+                <tbody>
+                  {low.slice(0, 6).map((it) => (
+                    <tr key={it.id}>
+                      <td>
+                        <div style={{ fontWeight: 600 }}>
+                          {it.name} <span className="mono">{it.strength}</span>
+                        </div>
+                        <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                          Rack {it.rack || "—"}
+                        </div>
+                      </td>
+                      <td style={{ textAlign: "right" }}>
+                        <span
+                          className="mono"
+                          style={{ fontWeight: 600, color: "var(--amber)" }}
+                        >
+                          {it.qty}
+                        </span>
+                        <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                          reorder at {it.reorder}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h">
+          <Receipt size={15} />
+          <strong>Latest bills</strong>
+          <button
+            className="btn sm g"
+            style={{ marginLeft: "auto" }}
+            onClick={() => go("bills")}
+          >
+            All <ChevronRight size={13} />
+          </button>
+        </div>
+        {bills.length === 0 ? (
+          <div className="empty" style={{ padding: 30 }}>
+            No bills raised yet.
+          </div>
+        ) : (
+          <div className="scroll">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Bill</th>
+                  <th>Patient</th>
+                  <th>Items</th>
+                  <th>Time</th>
+                  <th>Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...bills]
+                  .sort((a, b) => new Date(b.at) - new Date(a.at))
+                  .slice(0, 5)
+                  .map((b) => (
+                    <tr key={b.id}>
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        {b.no}
+                      </td>
+                      <td>{b.patient}</td>
+                      <td className="mono">{b.lines.length}</td>
+                      <td className="mono">
+                        {new Date(b.at).toLocaleTimeString("en-IN", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </td>
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        {money(b.net)}
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   STAFF / SETTINGS
+   ============================================================ */
+function Staff({ users, user, stock, bills, onExport, onReset }) {
+  return (
+    <div className="pad" style={{ display: "grid", gap: 16, maxWidth: 900 }}>
+      <div>
+        <div className="eyebrow">Administration</div>
+        <h2 style={{ fontSize: 22, margin: "2px 0 0" }}>Staff &amp; data</h2>
+      </div>
+
+      <div className="card">
+        <div className="card-h">
+          <Users size={15} />
+          <strong>Accounts with counter access</strong>
+        </div>
+        <div className="scroll">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Added</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((u) => (
+                <tr key={u.id}>
+                  <td style={{ fontWeight: 600 }}>
+                    {u.name}
+                    {u.id === user.id && (
+                      <span className="tag t-ok" style={{ marginLeft: 8 }}>
+                        You
+                      </span>
+                    )}
+                  </td>
+                  <td className="mono" style={{ fontSize: 12.5 }}>
+                    {u.email}
+                  </td>
+                  <td>{u.role}</td>
+                  <td className="mono">{fmtDate(u.createdAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div
+          className="card-b"
+          style={{
+            borderTop: "1px solid var(--line2)",
+            color: "var(--muted)",
+            fontSize: 12.5,
+          }}
+        >
+          New staff create their own account from the sign-in screen, then set
+          their own security question. Passwords are never stored in readable
+          form.
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-h">
+          <ShieldCheck size={15} />
+          <strong>Database</strong>
+        </div>
+        <div className="card-b" style={{ display: "grid", gap: 12 }}>
+          <div className="grid g3">
+            <Stat label="Stock records" value={stock.length} />
+            <Stat label="Bill records" value={bills.length} />
+            <Stat label="User records" value={users.length} />
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button className="btn" onClick={onExport}>
+              <Download size={15} /> Export everything as JSON
+            </button>
+            <button className="btn d" onClick={onReset}>
+              <RotateCcw size={15} /> Wipe stock and bills
+            </button>
+          </div>
+          <p style={{ fontSize: 12.5, color: "var(--muted)", margin: 0 }}>
+            The export is a full backup — stock, bills and account records
+            (passwords stay hashed). Wiping clears stock and bills but keeps the
+            staff accounts.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   ROOT
+   ============================================================ */
+export default function PharmacySystem() {
+  const [ready, setReady] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [user, setUser] = useState(null);
+  const [stock, setStock] = useState([]);
+  const [bills, setBills] = useState([]);
+  const [tab, setTab] = useState("dashboard");
+
+  /* --- boot --- */
+  useEffect(() => {
+    (async () => {
+      const u = await dbGet(K.users, []);
+      let s = await dbGet(K.stock, null);
+      const b = await dbGet(K.bills, []);
+      const sess = await dbGet(K.session, null);
+      if (s === null) {
+        s = seedStock();
+        await dbSet(K.stock, s);
+      }
+      setUsers(u);
+      setStock(s);
+      setBills(b);
+      if (sess) {
+        const f = u.find((x) => x.id === sess);
+        if (f) setUser(f);
+      }
+      setReady(true);
+    })();
+  }, []);
+
+  const saveStock = async (next) => {
+    setStock(next);
+    await dbSet(K.stock, next);
+  };
+  const saveBills = async (next) => {
+    setBills(next);
+    await dbSet(K.bills, next);
+  };
+
+  /* --- auth handlers --- */
+  const signup = async ({ name, email, pharmacy, pw, q, a }) => {
+    const salt = randSalt();
+    const nu = {
+      id: uid(),
+      name,
+      email,
+      pharmacy:
+        pharmacy || (users[0] && users[0].pharmacy) || "Hospital Pharmacy",
+      role: users.length ? "Pharmacist" : "Chief Pharmacist",
+      salt,
+      pass: await hash(pw, salt),
+      q,
+      ans: await hash(a.toLowerCase(), salt),
+      createdAt: new Date().toISOString(),
+    };
+    const next = [...users, nu];
+    setUsers(next);
+    await dbSet(K.users, next);
+    setUser(nu);
+    await dbSet(K.session, nu.id);
+  };
+
+  const login = async (email, pw) => {
+    const u = users.find((x) => x.email.toLowerCase() === email.toLowerCase());
+    if (!u) return "No account uses that email.";
+    const h = await hash(pw, u.salt);
+    if (h !== u.pass) return "That password doesn't match this account.";
+    setUser(u);
+    await dbSet(K.session, u.id);
+    return null;
+  };
+
+  const reset = async (ru, ans, newPw) => {
+    const h = await hash(ans.toLowerCase(), ru.salt);
+    if (h !== ru.ans) return "That answer doesn't match what's on the account.";
+    const salt = randSalt();
+    const next = users.map((x) =>
+      x.id === ru.id ? { ...x, salt, pass: null } : x,
+    );
+    const idx = next.findIndex((x) => x.id === ru.id);
+    next[idx].pass = await hash(newPw, salt);
+    next[idx].ans = await hash(ans.toLowerCase(), salt);
+    setUsers(next);
+    await dbSet(K.users, next);
+    return null;
+  };
+
+  const logout = async () => {
+    setUser(null);
+    setTab("dashboard");
+    await dbDel(K.session);
+  };
+
+  /* --- data handlers --- */
+  const addStock = async (item) => saveStock([...stock, item]);
+  const delStock = async (id) => saveStock(stock.filter((i) => i.id !== id));
+  const adjStock = async (id, d) =>
+    saveStock(
+      stock.map((i) =>
+        i.id === id ? { ...i, qty: Math.max(0, i.qty + d) } : i,
+      ),
+    );
+
+  const makeBill = async (bill) => {
+    await saveBills([...bills, bill]);
+    const next = stock.map((i) => {
+      const l = bill.lines.find((x) => x.id === i.id);
+      return l ? { ...i, qty: Math.max(0, i.qty - l.qty) } : i;
+    });
+    await saveStock(next);
+  };
+
+  const exportAll = () => {
+    const blob = new Blob(
+      [
+        JSON.stringify(
+          { users, stock, bills, exportedAt: new Date().toISOString() },
+          null,
+          2,
+        ),
+      ],
+      { type: "application/json" },
+    );
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `pharmacy-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+  };
+
+  const wipe = async () => {
+    if (
+      !window.confirm(
+        "This clears all stock and bill records. Staff accounts stay. Continue?",
+      )
+    )
+      return;
+    await saveStock([]);
+    await saveBills([]);
+  };
+
+  if (!ready)
+    return (
+      <div
+        className="rx"
+        style={{ display: "grid", placeItems: "center", minHeight: "100vh" }}
+      >
+        <style>{CSS}</style>
+        <div style={{ textAlign: "center", color: "var(--muted)" }}>
+          <Pill size={26} />
+          <p>Opening the pharmacy records…</p>
+        </div>
+      </div>
+    );
+
+  if (!user)
+    return (
+      <Auth users={users} onSignup={signup} onLogin={login} onReset={reset} />
+    );
+
+  const expiredCount = stock.filter(
+    (i) => expiryState(i.expiry).key === "expired",
+  ).length;
+  const NAV = [
+    { k: "dashboard", t: "Dashboard", i: LayoutGrid },
+    { k: "add", t: "Add stock", i: Plus },
+    { k: "inventory", t: "Stock on hand", i: Boxes, n: stock.length },
+    { k: "billing", t: "Dispense & bill", i: Receipt },
+    { k: "bills", t: "Bill history", i: Printer, n: bills.length },
+    {
+      k: "expiry",
+      t: "Expiry desk",
+      i: CalendarClock,
+      n: expiredCount || undefined,
+    },
+    { k: "staff", t: "Staff & data", i: Users },
+  ];
+
+  return (
+    <div className="rx">
+      <style>{CSS}</style>
+      <div className="shell">
+        <nav className="rail no-print">
+          <div className="rail-brand">
+            <div
+              style={{
+                width: 30,
+                height: 30,
+                background: "var(--teal)",
+                display: "grid",
+                placeItems: "center",
+                borderRadius: 2,
+              }}
+            >
+              <Pill size={16} color="#fff" />
+            </div>
+            <div>
+              <div
+                className="disp"
+                style={{ fontSize: 15, fontWeight: 600, color: "#fff" }}
+              >
+                APOTHECA
+              </div>
+              <div className="eyebrow" style={{ color: "#7FA0B3" }}>
+                {user.pharmacy}
+              </div>
+            </div>
+          </div>
+          {NAV.map((n) => (
+            <button
+              key={n.k}
+              className={`nav ${tab === n.k ? "on" : ""}`}
+              onClick={() => setTab(n.k)}
+            >
+              <n.i size={16} /> {n.t}
+              {n.n !== undefined && n.n !== 0 && (
+                <span className="cnt">{n.n}</span>
+              )}
+            </button>
+          ))}
+          <button
+            className="nav"
+            style={{ marginTop: "auto" }}
+            onClick={logout}
+          >
+            <LogOut size={16} /> Sign out
+          </button>
+        </nav>
+
+        <div className="main">
+          <header className="topbar no-print">
+            <div>
+              <div className="eyebrow">{user.pharmacy}</div>
+              <strong className="disp" style={{ fontSize: 16 }}>
+                {NAV.find((n) => n.k === tab)?.t}
+              </strong>
+            </div>
+            <div
+              style={{
+                marginLeft: "auto",
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+              }}
+            >
+              {expiredCount > 0 && (
+                <span className="tag t-bad">
+                  <AlertTriangle size={12} /> {expiredCount} expired
+                </span>
+              )}
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{user.name}</div>
+                <div className="eyebrow">{user.role}</div>
+              </div>
+            </div>
+          </header>
+
+          {tab === "dashboard" && (
+            <Dashboard stock={stock} bills={bills} user={user} go={setTab} />
+          )}
+          {tab === "add" && (
+            <AddMedicine stock={stock} onAdd={addStock} user={user} />
+          )}
+          {tab === "inventory" && (
+            <Inventory stock={stock} onDelete={delStock} onAdjust={adjStock} />
+          )}
+          {tab === "billing" && (
+            <Billing
+              stock={stock}
+              user={user}
+              pharmacy={user.pharmacy}
+              bills={bills}
+              onBill={makeBill}
+            />
+          )}
+          {tab === "bills" && <Bills bills={bills} />}
+          {tab === "expiry" && <Expiry stock={stock} onDelete={delStock} />}
+          {tab === "staff" && (
+            <Staff
+              users={users}
+              user={user}
+              stock={stock}
+              bills={bills}
+              onExport={exportAll}
+              onReset={wipe}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
